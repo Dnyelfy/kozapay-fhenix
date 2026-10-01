@@ -1,21 +1,25 @@
 import { useEffect, useRef, useState } from "react";
-import { ethers } from "ethers";
+import { formatEther, isAddress, parseEther, type Address } from "viem";
 import {
-  initCofhe,
+  KOZAPAY_ADDRESS,
+  EXPLORER,
+  MAX_PAYROLL,
+  connectWallet,
   deposit,
   send,
   payroll,
   claim,
   recall,
-  unsealBalance,
-  unsealPaymentAmount,
-  KOZAPAY_ADDRESS,
-  KOZAPAY_ABI,
-} from "./kozapayCofhe";
-
-const USDC_DECIMALS = 6;
-const toUnits = (x: string) => ethers.parseUnits(x || "0", USDC_DECIMALS);
-const fromUnits = (x: bigint) => ethers.formatUnits(x, USDC_DECIMALS);
+  requestWithdraw,
+  finalizeWithdraw,
+  hasPendingWithdraw,
+  myBalance,
+  myPayments,
+  paymentAmount,
+  deployKozaPay,
+  type PaymentRow,
+  type Session,
+} from "./kozapay";
 
 const prefersReduced =
   typeof window !== "undefined" &&
@@ -71,115 +75,154 @@ function Cipher({ value, big }: { value: string | null; big?: boolean }) {
   );
 }
 
-type PaymentRow = {
-  id: number;
-  from: string;
-  to: string;
-  claimed: boolean;
-  recalled: boolean;
-  amount: string | null;
-};
+function toWei(x: string): bigint {
+  const v = x.trim();
+  if (!/^\d+(\.\d{1,18})?$/.test(v)) throw new Error(`"${x}" is not a valid ETH amount.`);
+  const w = parseEther(v);
+  if (w <= 0n) throw new Error("Amount must be greater than 0.");
+  return w;
+}
+
+function niceError(e: any): string {
+  const m = String(e?.shortMessage ?? e?.reason ?? e?.message ?? e);
+  if (/user rejected|denied/i.test(m)) return "you cancelled it in your wallet";
+  if (/insufficient funds/i.test(m)) return "not enough ETH for this and gas";
+  return m.split("\n")[0].slice(0, 180);
+}
+
+const short = (a: string) => a.slice(0, 6) + "…" + a.slice(-4);
 
 export default function App() {
-  const [signer, setSigner] = useState<ethers.Signer | null>(null);
-  const [account, setAccount] = useState("");
-  const [status, setStatus] = useState("cüzdan bekleniyor");
+  const [s, setS] = useState<Session | null>(null);
+  const [status, setStatus] = useState("waiting for wallet");
   const [busy, setBusy] = useState(false);
 
   const [depositAmt, setDepositAmt] = useState("");
   const [sendTo, setSendTo] = useState("");
   const [sendAmt, setSendAmt] = useState("");
   const [payrollText, setPayrollText] = useState("");
+  const [withdrawAmt, setWithdrawAmt] = useState("");
+  const [pending, setPending] = useState(false);
   const [balance, setBalance] = useState<string | null>(null);
-  const [rows, setRows] = useState<PaymentRow[]>([]);
+  const [rows, setRows] = useState<(PaymentRow & { amount: string | null })[]>([]);
+  const [deployed, setDeployed] = useState<string>("");
+
+  const ready = !!s && !!KOZAPAY_ADDRESS;
 
   async function connect() {
     try {
-      const eth = (window as any).ethereum;
-      if (!eth) return setStatus("MetaMask bulunamadı");
-      const provider = new ethers.BrowserProvider(eth);
-      await provider.send("eth_requestAccounts", []);
-      const s = await provider.getSigner();
-      setStatus("cofhejs başlatılıyor");
-      await initCofhe(s, provider);
-      setSigner(s);
-      setAccount(await s.getAddress());
-      setStatus("bağlı · Arbitrum Sepolia");
-    } catch (e: any) {
-      setStatus("bağlantı hatası — " + (e?.message ?? e));
-    }
-  }
-
-  async function run(label: string, fn: () => Promise<any>, after?: () => void) {
-    if (!signer) return setStatus("önce cüzdanı bağla");
-    try {
       setBusy(true);
-      setStatus(label + " gönderiliyor");
-      const tx = await fn();
-      if (tx?.wait) await tx.wait();
-      setStatus(label + " tamam");
-      after?.();
+      setStatus("connecting");
+      const session = await connectWallet((step) => setStatus(step));
+      setS(session);
+      setStatus("connected · Arbitrum Sepolia");
+      if (KOZAPAY_ADDRESS) {
+        refreshLedger(session);
+        hasPendingWithdraw(session).then(setPending).catch(() => {});
+      }
     } catch (e: any) {
-      setStatus(label + " hatası — " + (e?.reason ?? e?.message ?? e));
+      setStatus("connection error: " + niceError(e));
     } finally {
       setBusy(false);
     }
   }
 
-  async function showBalance() {
-    if (!signer) return setStatus("önce cüzdanı bağla");
+  async function run(label: string, fn: () => Promise<any>, after?: () => void) {
+    if (!s) return setStatus("connect your wallet first");
     try {
-      setStatus("bakiye çözülüyor");
-      const b = await unsealBalance(signer, account);
-      setBalance(fromUnits(b));
-      setStatus("bakiye çözüldü");
+      setBusy(true);
+      setStatus(label + "…");
+      await fn();
+      setStatus(label + " done");
+      after?.();
     } catch (e: any) {
-      setStatus("çözme hatası — " + (e?.message ?? e));
+      setStatus(label + " failed: " + niceError(e));
+    } finally {
+      setBusy(false);
     }
   }
 
-  async function loadPayments() {
-    if (!signer) return;
+  async function showBalance(session = s) {
+    if (!session) return setStatus("connect your wallet first");
     try {
-      setStatus("defter yükleniyor");
-      const c = new ethers.Contract(KOZAPAY_ADDRESS, KOZAPAY_ABI, signer);
-      const count: bigint = await c.paymentsCount();
-      const me = account.toLowerCase();
-      const out: PaymentRow[] = [];
-      for (let i = 0; i < Number(count); i++) {
-        const p = await c.payments(i);
-        if (p.from.toLowerCase() !== me && p.to.toLowerCase() !== me) continue;
-        out.push({ id: i, from: p.from, to: p.to, claimed: p.claimed, recalled: p.recalled, amount: null });
-      }
-      setRows(out);
-      setStatus(out.length + " kayıt");
+      setStatus("decrypting your balance");
+      const b = await myBalance(session);
+      setBalance(formatEther(b));
+      setStatus("balance decrypted");
     } catch (e: any) {
-      setStatus("defter hatası — " + (e?.message ?? e));
+      setStatus("decrypt failed: " + niceError(e));
     }
   }
 
-  async function revealRow(id: number) {
+  async function refreshLedger(session = s) {
+    if (!session) return;
     try {
-      const v = await unsealPaymentAmount(signer!, id);
-      setRows((rs) => rs.map((r) => (r.id === id ? { ...r, amount: fromUnits(v) } : r)));
+      setStatus("loading your payments");
+      const list = await myPayments(session);
+      setRows(list.map((r) => ({ ...r, amount: null })));
+      setStatus(list.length + (list.length === 1 ? " payment" : " payments"));
     } catch (e: any) {
-      setStatus("çözme hatası — " + (e?.message ?? e));
+      setStatus("ledger failed: " + niceError(e));
     }
+  }
+
+  async function revealRow(row: PaymentRow) {
+    if (!s) return;
+    try {
+      const v = await paymentAmount(s, row);
+      setRows((rs) => rs.map((r) => (r.id === row.id ? { ...r, amount: formatEther(v) } : r)));
+    } catch (e: any) {
+      setStatus("decrypt failed: " + niceError(e));
+    }
+  }
+
+  function doSend() {
+    run("Private send", async () => {
+      const to = sendTo.trim();
+      if (!isAddress(to)) throw new Error("Recipient is not a valid address.");
+      await send(s!, to as Address, toWei(sendAmt));
+      setSendAmt("");
+    }, () => { refreshLedger(); setBalance(null); });
   }
 
   function doPayroll() {
-    const lines = payrollText.split("\n").map((l) => l.trim()).filter(Boolean);
-    const recipients: string[] = [];
-    const amounts: bigint[] = [];
-    for (const l of lines) {
-      const [addr, amt] = l.split(",").map((x) => x.trim());
-      recipients.push(addr);
-      amounts.push(toUnits(amt));
-    }
-    run("Bordro", () => payroll(signer!, recipients, amounts), loadPayments);
+    run("Payroll", async () => {
+      const lines = payrollText.split("\n").map((l) => l.trim()).filter(Boolean);
+      const to: Address[] = [];
+      const amounts: bigint[] = [];
+      for (const l of lines) {
+        const [a, amt] = l.split(",").map((x) => (x ?? "").trim());
+        if (!isAddress(a)) throw new Error(`"${a}" is not a valid address.`);
+        to.push(a as Address);
+        amounts.push(toWei(amt ?? ""));
+      }
+      await payroll(s!, to, amounts);
+      setPayrollText("");
+    }, () => { refreshLedger(); setBalance(null); });
   }
 
-  const short = (a: string) => a.slice(0, 6) + "…" + a.slice(-4);
+  function doRequestWithdraw() {
+    run("Withdraw request", async () => {
+      await requestWithdraw(s!, toWei(withdrawAmt));
+      setWithdrawAmt("");
+      setPending(true);
+    }, () => setBalance(null));
+  }
+
+  function doFinalizeWithdraw() {
+    run("Withdraw", async () => {
+      const got = await finalizeWithdraw(s!);
+      setPending(false);
+      if (got === 0n) throw new Error("Your balance was too small, so 0 ETH was set aside. Nothing was sent.");
+    }, () => setBalance(null));
+  }
+
+  function doDeploy() {
+    run("Deploy", async () => {
+      const a = await deployKozaPay(s!);
+      setDeployed(a);
+    });
+  }
 
   return (
     <div className="page">
@@ -189,83 +232,131 @@ export default function App() {
           <span className="mark">KOZAPAY</span>
           <span className="net">Fhenix · Arbitrum Sepolia</span>
         </div>
-        {account ? (
-          <span className="wallet">{short(account)}</span>
+        {s ? (
+          <span className="wallet">{short(s.account)}</span>
         ) : (
-          <button className="connect" onClick={connect}>Cüzdanı bağla</button>
+          <button className="connect" onClick={connect} disabled={busy}>Connect wallet</button>
         )}
       </header>
 
       <div className="ticker">
-        <span className="dot" data-on={!!account} />
+        <span className="dot" data-on={!!s} />
         {status}
       </div>
 
+      {!KOZAPAY_ADDRESS && (
+        <section className="mod deploy">
+          <div className="mod-head">
+            <span className="step">00</span>
+            <div><h3>Deploy the contract</h3><span className="verb">one time · Arbitrum Sepolia</span></div>
+          </div>
+          <p className="mod-sub">
+            This copy of KozaPay has no contract yet. Connect your wallet and deploy it once. Then put the
+            address in <code>kozapay.ts</code> and publish the site again.
+          </p>
+          <button disabled={busy || !s} onClick={doDeploy}>Deploy KozaPay</button>
+          {deployed && (
+            <p className="deployed">
+              Deployed at <code>{deployed}</code>{" "}
+              <a href={`${EXPLORER}/address/${deployed}`} target="_blank" rel="noreferrer">view</a>
+            </p>
+          )}
+        </section>
+      )}
+
       <section className="vault">
-        <div className="vault-eyebrow">şifreli bakiye</div>
+        <div className="vault-eyebrow">encrypted balance</div>
         <Cipher value={balance} big />
-        <div className="vault-unit">{balance !== null ? "USDC" : "zincirde görünmez"}</div>
-        <button className="reveal" onClick={showBalance} disabled={!account}>
-          {balance !== null ? "yeniden çöz" : "çöz →"}
+        <div className="vault-unit">{balance !== null ? "ETH" : "invisible on-chain"}</div>
+        <button className="reveal" onClick={() => showBalance()} disabled={!ready || busy}>
+          {balance !== null ? "decrypt again" : "decrypt →"}
         </button>
-        <p className="vault-note">Tutar zincirde euint128 olarak duruyor. Yalnızca senin cüzdanın çözebilir.</p>
+        <p className="vault-note">Your balance is stored on-chain as a euint128. Only your wallet can decrypt it.</p>
       </section>
 
       <section className="flow">
         <article className="mod">
           <div className="mod-head">
             <span className="step">01</span>
-            <div><h3>Yatır</h3><span className="verb">encrypt</span></div>
+            <div><h3>Deposit</h3><span className="verb">encrypt</span></div>
           </div>
-          <p className="mod-sub">USDC'yi kasaya al. Bu adımda tutar public (giriş kapısı).</p>
-          <input placeholder="0.00" value={depositAmt} onChange={(e) => setDepositAmt(e.target.value)} />
-          <button disabled={busy || !account} onClick={() => run("Yatırma", () => deposit(signer!, toUnits(depositAmt)), showBalance)}>Kasaya yatır</button>
+          <p className="mod-sub">Move ETH into your private balance. The deposit amount is public; everything after it is not.</p>
+          <input placeholder="0.01 ETH" inputMode="decimal" value={depositAmt} onChange={(e) => setDepositAmt(e.target.value)} />
+          <button
+            disabled={busy || !ready}
+            onClick={() => run("Deposit", async () => { await deposit(s!, toWei(depositAmt)); setDepositAmt(""); }, () => setBalance(null))}
+          >
+            Deposit
+          </button>
         </article>
 
         <article className="mod">
           <div className="mod-head">
             <span className="step">02</span>
-            <div><h3>Gizli gönder</h3><span className="verb">transfer · geri alınabilir</span></div>
+            <div><h3>Private send</h3><span className="verb">transfer · recallable</span></div>
           </div>
-          <p className="mod-sub">Tutar şifreli gider. Alıcı çekene kadar geri alabilirsin.</p>
-          <input placeholder="alıcı 0x…" value={sendTo} onChange={(e) => setSendTo(e.target.value)} />
-          <input placeholder="tutar" value={sendAmt} onChange={(e) => setSendAmt(e.target.value)} />
-          <button disabled={busy || !account} onClick={() => run("Gönderim", () => send(signer!, sendTo.trim(), toUnits(sendAmt)), loadPayments)}>Gönder</button>
+          <p className="mod-sub">The amount travels encrypted. You can take it back until the recipient claims it.</p>
+          <input placeholder="recipient 0x…" value={sendTo} onChange={(e) => setSendTo(e.target.value)} />
+          <input placeholder="amount in ETH" inputMode="decimal" value={sendAmt} onChange={(e) => setSendAmt(e.target.value)} />
+          <button disabled={busy || !ready} onClick={doSend}>Send</button>
         </article>
 
         <article className="mod wide">
           <div className="mod-head">
             <span className="step">03</span>
-            <div><h3>Gizli bordro</h3><span className="verb">transfer · max 20 · herkes yalnız kendi tutarını görür</span></div>
+            <div><h3>Private payroll</h3><span className="verb">transfer · max {MAX_PAYROLL} · each person sees only their own amount</span></div>
           </div>
-          <p className="mod-sub">Her satır: adres,tutar</p>
-          <textarea rows={4} placeholder={"0xabc…,100\n0xdef…,250"} value={payrollText} onChange={(e) => setPayrollText(e.target.value)} />
-          <button disabled={busy || !account} onClick={doPayroll}>Bordroyu dağıt</button>
+          <p className="mod-sub">One line per person: address,amount in ETH</p>
+          <textarea rows={4} placeholder={"0xabc…,0.01\n0xdef…,0.025"} value={payrollText} onChange={(e) => setPayrollText(e.target.value)} />
+          <button disabled={busy || !ready} onClick={doPayroll}>Send payroll</button>
+        </article>
+
+        <article className="mod wide">
+          <div className="mod-head">
+            <span className="step">04</span>
+            <div><h3>Withdraw</h3><span className="verb">decrypt · two steps</span></div>
+          </div>
+          {!pending ? (
+            <>
+              <p className="mod-sub">Step 1: set an amount aside from your private balance. If your balance is too small, 0 is set aside.</p>
+              <input placeholder="amount in ETH" inputMode="decimal" value={withdrawAmt} onChange={(e) => setWithdrawAmt(e.target.value)} />
+              <button disabled={busy || !ready} onClick={doRequestWithdraw}>Set aside</button>
+            </>
+          ) : (
+            <>
+              <p className="mod-sub">Step 2: the Fhenix network decrypts the amount you set aside and signs it. Submit it to receive your ETH.</p>
+              <button disabled={busy || !ready} onClick={doFinalizeWithdraw}>Receive ETH</button>
+            </>
+          )}
         </article>
       </section>
 
       <section className="ledger">
         <div className="ledger-head">
-          <h3>Defter</h3>
-          <button className="ghost" onClick={loadPayments} disabled={!account}>yenile</button>
+          <h3>Ledger</h3>
+          <button className="ghost" onClick={() => refreshLedger()} disabled={!ready || busy}>refresh</button>
         </div>
-        {rows.length === 0 && <div className="empty">Kayıt yok. Bir gönderim yap, sonra “yenile”.</div>}
+        {rows.length === 0 && <div className="empty">No payments yet. Send one, then hit “refresh”.</div>}
         {rows.map((r) => {
-          const incoming = r.to.toLowerCase() === account.toLowerCase();
+          const incoming = r.to.toLowerCase() === s?.account.toLowerCase();
           const settled = r.claimed || r.recalled;
-          const state = r.claimed ? "alındı" : r.recalled ? "geri alındı" : "bekliyor";
+          const state = r.claimed ? "claimed" : r.recalled ? "recalled" : "pending";
           return (
-            <div className="entry" key={r.id}>
+            <div className="entry" key={r.id.toString()}>
               <div className="entry-left">
-                <span className="entry-id">#{r.id}</span>
-                <span className={"arrow " + (incoming ? "in" : "out")}>{incoming ? "gelen" : "giden"}</span>
+                <span className="entry-id">#{r.id.toString()}</span>
+                <span className={"arrow " + (incoming ? "in" : "out")}>{incoming ? "in" : "out"}</span>
                 <span className="entry-peer">{short(incoming ? r.from : r.to)}</span>
                 <span className={"pill " + (r.claimed ? "ok" : r.recalled ? "no" : "wait")}>{state}</span>
               </div>
               <div className="entry-right">
-                <button className="chip" onClick={() => revealRow(r.id)}><Cipher value={r.amount} /></button>
-                {!settled && incoming && <button className="act" onClick={() => run("Claim", () => claim(signer!, r.id), loadPayments)}>al</button>}
-                {!settled && !incoming && <button className="act" onClick={() => run("Recall", () => recall(signer!, r.id), loadPayments)}>geri al</button>}
+                <button className="chip" onClick={() => revealRow(r)} title="decrypt amount"><Cipher value={r.amount} /></button>
+                {!settled && incoming && (
+                  <button className="act" disabled={busy} onClick={() => run("Claim", () => claim(s!, r.id), () => { refreshLedger(); setBalance(null); })}>claim</button>
+                )}
+                {!settled && !incoming && (
+                  <button className="act" disabled={busy} onClick={() => run("Recall", () => recall(s!, r.id), () => { refreshLedger(); setBalance(null); })}>recall</button>
+                )}
               </div>
             </div>
           );
@@ -273,8 +364,12 @@ export default function App() {
       </section>
 
       <footer>
-        <span>KozaPay · FHE üzerinde gizli ödeme</span>
-        <a href={"https://sepolia.arbiscan.io/address/" + KOZAPAY_ADDRESS} target="_blank" rel="noreferrer">{short(KOZAPAY_ADDRESS)}</a>
+        <span>KozaPay · private payments on FHE</span>
+        {KOZAPAY_ADDRESS ? (
+          <a href={`${EXPLORER}/address/${KOZAPAY_ADDRESS}`} target="_blank" rel="noreferrer">{short(KOZAPAY_ADDRESS)}</a>
+        ) : (
+          <span>contract not deployed</span>
+        )}
       </footer>
     </div>
   );

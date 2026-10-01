@@ -160,3 +160,10 @@ footer a { color: var(--ash); text-decoration: none; }
 footer a:hover { color: var(--ember); }
 
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+
+/* deploy panel */
+.mod.deploy { margin: 0 0 24px; border-color: rgba(255, 106, 61, 0.45); }
+.mod.deploy code, .deployed code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; word-break: break-all; }
+.deployed { margin-top: 12px; font-size: 14px; }
+.deployed a { margin-left: 6px; }
+button:disabled { cursor: not-allowed; }
