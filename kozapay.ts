@@ -20,7 +20,7 @@ import { KOZAPAY_ABI, KOZAPAY_BYTECODE } from "./kozapayArtifact";
 // ---- config -----------------------------------------------------------------
 // Set this to the address printed by the deploy panel, then redeploy the site.
 // While it is empty, the app shows the one-time deploy panel instead.
-export const KOZAPAY_ADDRESS = "" as Address | "";
+export const KOZAPAY_ADDRESS = "0xa9f5e0819399938e953be5361fb6843456a32204" as Address | "";
 
 export const CHAIN = arbitrumSepolia;
 export const EXPLORER = "https://sepolia.arbiscan.io";
@@ -75,6 +75,20 @@ export async function connectWallet(onStep?: (s: string) => void): Promise<Sessi
 }
 
 // ---- helpers ------------------------------------------------------------------
+// Arbitrum Sepolia's base fee can jump between the estimate and the block, which makes
+// the wallet's fee too low ("max fee per gas less than block base fee"). Give the max
+// fee generous headroom; only the actual base fee is charged, the rest is never spent.
+async function fees(s: Session) {
+  const block = await s.publicClient.getBlock();
+  const base = block.baseFeePerGas ?? 0n;
+  const est = await s.publicClient.estimateFeesPerGas().catch(() => null);
+  const priority = est?.maxPriorityFeePerGas ?? 0n;
+  const fromEst = est?.maxFeePerGas ?? 0n;
+  const floor = base * 3n + priority;
+  const maxFeePerGas = fromEst * 2n > floor ? fromEst * 2n : floor;
+  return { maxFeePerGas, maxPriorityFeePerGas: priority };
+}
+
 function addr(): Address {
   if (!KOZAPAY_ADDRESS) throw new Error("Contract address is not set yet.");
   return KOZAPAY_ADDRESS;
@@ -89,7 +103,7 @@ async function write(s: Session, functionName: string, args: any[] = [], value?:
     account: s.account,
     value,
   } as any);
-  const hash = await s.walletClient.writeContract(request as any);
+  const hash = await s.walletClient.writeContract({ ...(request as any), ...(await fees(s)) });
   const receipt = await s.publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error("Transaction failed: " + hash);
   return hash;
@@ -189,6 +203,7 @@ export async function deployKozaPay(s: Session): Promise<Address> {
     bytecode: KOZAPAY_BYTECODE,
     account: s.account,
     chain: CHAIN,
+    ...(await fees(s)),
   } as any);
   const receipt = await s.publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success" || !receipt.contractAddress) throw new Error("Deploy failed: " + hash);
