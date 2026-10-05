@@ -118,9 +118,25 @@ async function read<T>(s: Session, functionName: string, args: any[] = []): Prom
   } as any)) as T;
 }
 
-async function encrypt(s: Session, amounts: bigint[]) {
+export type Progress = (message: string) => void;
+
+const STEP_TEXT: Record<string, string> = {
+  initTfhe: "preparing encryption",
+  fetchKeys: "downloading Fhenix keys",
+  pack: "encrypting the amount",
+  prove: "building the proof (can take 1-2 minutes, keep this tab open)",
+  verify: "Fhenix is checking the proof",
+};
+
+async function encrypt(s: Session, amounts: bigint[], onProgress?: Progress) {
   const items = amounts.map((a) => Encryptable.uint128(a));
-  const out = (await s.cofhe.encryptInputs(items).setConsumingContract(addr()).execute()) as unknown as Hex[];
+  const out = (await s.cofhe
+    .encryptInputs(items)
+    .setConsumingContract(addr())
+    .onStep((step: string, ctx?: { isStart?: boolean }) => {
+      if (ctx?.isStart && STEP_TEXT[step]) onProgress?.(STEP_TEXT[step]);
+    })
+    .execute()) as unknown as Hex[];
   const proof = out[out.length - 1];
   const hashes = out.slice(0, -1);
   return { hashes, proof };
@@ -139,15 +155,17 @@ export function deposit(s: Session, wei: bigint) {
   return write(s, "deposit", [], wei);
 }
 
-export async function send(s: Session, to: Address, wei: bigint) {
-  const { hashes, proof } = await encrypt(s, [wei]);
+export async function send(s: Session, to: Address, wei: bigint, onProgress?: Progress) {
+  const { hashes, proof } = await encrypt(s, [wei], onProgress);
+  onProgress?.("confirm the transaction in your wallet");
   return write(s, "send", [to, hashes[0], proof]);
 }
 
-export async function payroll(s: Session, to: Address[], weis: bigint[]) {
+export async function payroll(s: Session, to: Address[], weis: bigint[], onProgress?: Progress) {
   if (to.length !== weis.length) throw new Error("Each line needs an address and an amount.");
   if (to.length === 0 || to.length > MAX_PAYROLL) throw new Error(`Payroll takes 1 to ${MAX_PAYROLL} recipients.`);
-  const { hashes, proof } = await encrypt(s, weis);
+  const { hashes, proof } = await encrypt(s, weis, onProgress);
+  onProgress?.("confirm the transaction in your wallet");
   return write(s, "payroll", [to, hashes, proof]);
 }
 

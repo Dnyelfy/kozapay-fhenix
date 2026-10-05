@@ -180,7 +180,7 @@ export default function App() {
     run("Private send", async () => {
       const to = sendTo.trim();
       if (!isAddress(to)) throw new Error("Recipient is not a valid address.");
-      await send(s!, to as Address, toWei(sendAmt));
+      await send(s!, to as Address, toWei(sendAmt), (m) => setStatus("Private send: " + m));
       setSendAmt("");
     }, () => { refreshLedger(); setBalance(null); });
   }
@@ -196,7 +196,7 @@ export default function App() {
         to.push(a as Address);
         amounts.push(toWei(amt ?? ""));
       }
-      await payroll(s!, to, amounts);
+      await payroll(s!, to, amounts, (m) => setStatus("Payroll: " + m));
       setPayrollText("");
     }, () => { refreshLedger(); setBalance(null); });
   }
